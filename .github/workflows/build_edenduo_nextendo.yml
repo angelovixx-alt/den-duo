@@ -21,7 +21,7 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Accept Android SDK Licenses & Install CMake 3.31.6 + NDK
+      - name: Accept Android SDK Licenses & Install CMake 3.31.6 + NDK 28.2.13676358
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "cmake;3.31.6" "ndk;28.2.13676358" "platforms;android-36" "build-tools;36.0.0" > /dev/null
@@ -42,6 +42,7 @@ jobs:
             -storepass android123 -keypass android123 \
             -dname "CN=EdenDuoNextendo, OU=Dev, O=EdenDuo, L=City, S=State, C=US"
           echo "ANDROID_KEYSTORE_FILE=/tmp/release.jks" >> $GITHUB_ENV
+          echo "ANDROID_KEYSTORE_B64=$(base64 -w 0 /tmp/release.jks)" >> $GITHUB_ENV
           echo "ANDROID_KEYSTORE_PASS=android123" >> $GITHUB_ENV
           echo "ANDROID_KEY_ALIAS=release" >> $GITHUB_ENV
 
@@ -53,7 +54,7 @@ jobs:
       - name: Merge Nextendo Stack into Eden Duo & Strip Debug Packet Logging
         run: |
           python3 - << 'PYEOF'
-          import os, re, shutil, subprocess, pathlib
+          import os, re, shutil, pathlib
 
           duo = pathlib.Path("workspace-edenduo")
           den = pathlib.Path("workspace-den2")
@@ -100,7 +101,6 @@ jobs:
               "src/core/hle/service/ssl/cert_store.cpp",
               "src/core/hle/service/ssl/ssl.cpp",
               "src/core/hle/service/ssl/ssl_backend_openssl.cpp",
-              "src/core/arm/dynarmic/arm_dynarmic_32.cpp",
           ]
           for rel in hle_network_files:
               src = den / rel
@@ -132,9 +132,10 @@ jobs:
               if "WriteGuestBridge" not in txt:
                   txt = txt.replace(
                       "status = app_loader->Load(*process, system);",
-                      "Common::NextendoAccount::WriteGuestBridge(Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir));\n        status = app_loader->Load(*process, system);"
+                      "Common::NextendoAccount::LoadFromDisk();\n        Common::NextendoAccount::WriteGuestBridge(Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir));\n        status = app_loader->Load(*process, system);"
                   )
               core_cpp.write_text(txt, encoding="utf-8")
+              print("[+] Patched src/core/core.cpp with NextendoAccount::LoadFromDisk & WriteGuestBridge")
 
           nso_cpp = duo / "src/core/loader/nso.cpp"
           if nso_cpp.exists():
@@ -147,27 +148,9 @@ jobs:
                       "new_image = pm->PatchNSO(new_image, name);\n        new_image = NextendoS3Patches::ApplyIfMatch(nso_header.build_id, std::move(new_image), name);"
                   )
               nso_cpp.write_text(txt, encoding="utf-8")
+              print("[+] Patched src/core/loader/nso.cpp with NextendoS3Patches")
 
-          shutil.copy2(den / "src/android/app/src/main/jni/native.cpp", duo / "src/android/app/src/main/jni/native.cpp")
-          den_kt_root = den / "src/android/app/src/main/java/org/yuzu/yuzu_emu"
-          duo_kt_root = duo / "src/android/app/src/main/java/org/yuzu/yuzu_emu"
-          for p in den_kt_root.rglob("*Nextendo*"):
-              rel = p.relative_to(den_kt_root)
-              target = duo_kt_root / rel
-              target.parent.mkdir(parents=True, exist_ok=True)
-              shutil.copy2(p, target)
-
-          nl_duo = (duo_kt_root / "NativeLibrary.kt").read_text(encoding="utf-8")
-          nl_den = (den_kt_root / "NativeLibrary.kt").read_text(encoding="utf-8")
-          if "nextendoSignIn" not in nl_duo and "external fun setNextendoCaCertPath" in nl_den:
-              idx = nl_den.find("external fun setNextendoCaCertPath")
-              end_idx = nl_den.rfind("}")
-              snippet = nl_den[idx:end_idx]
-              last_brace = nl_duo.rfind("}")
-              nl_duo = nl_duo[:last_brace] + "\n    " + snippet + "\n}\n"
-              (duo_kt_root / "NativeLibrary.kt").write_text(nl_duo, encoding="utf-8")
-
-          print("[*] Surgical merge complete.")
+          print("[*] Surgical C++ merge complete.")
           PYEOF
 
       - name: Compile Unified EdenDuo + Nextendo Release APK (-O3 Release)
@@ -176,25 +159,18 @@ jobs:
         working-directory: workspace-edenduo
         run: |
           mkdir -p ../output-apks
-          if [ -f .ci/android/build.sh ]; then
-            sh .ci/android/build.sh -t standard -b Release
-            find artifacts src/android/app/build/outputs/apk -name "*.apk" -exec cp -v {} ../output-apks/ \; || true
-          else
-            cd src/android
-            chmod +x gradlew
-            ./gradlew assembleMainlineRelease -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=1g"
-            find app/build/outputs/apk -name "*.apk" -exec cp -v {} ../../output-apks/ \; || true
-          fi
+          sh .ci/android/build.sh -t standard -b Release
+          find artifacts src/android/app/build/outputs/apk -name "*.apk" -exec cp -v {} ../output-apks/EdenDuo-Nextendo-Release.apk \; || true
 
-      - name: Fallback Compile Pure Den2 in Full -O3 Release Mode
-        if: steps.build_unified.outcome == 'failure'
+      - name: Compile Den2 in Full -O3 Release Mode (Optimized Nextendo Build)
+        continue-on-error: true
         working-directory: workspace-den2
         run: |
           mkdir -p ../output-apks
           sh .ci/android/build.sh -t standard -b Release || sh .ci/android/build.sh -t standard -b RelWithDebInfo
           for f in artifacts/*.apk src/android/app/build/outputs/apk/**/*.apk; do
             if [ -f "$f" ]; then
-              cp -v "$f" ../output-apks/DEN-Nextendo-FullRelease.apk
+              cp -v "$f" ../output-apks/DEN-Turbo-Release.apk
             fi
           done
 
