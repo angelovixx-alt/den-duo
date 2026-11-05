@@ -21,26 +21,26 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Accept Android SDK Licenses & Install CMake 3.31.6 + NDK 28.2.13676358
+      - name: Free Disk Space & Install Android SDK / NDK 28.2.13676358
+        shell: bash
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "cmake;3.31.6" "ndk;28.2.13676358" "platforms;android-36" "build-tools;36.0.0" > /dev/null
+          set +e
+          set +o pipefail
+          sudo rm -rf "$ANDROID_HOME/ndk/"25* "$ANDROID_HOME/ndk/"26* "$ANDROID_HOME/ndk/"27* "$ANDROID_HOME/.temp"
+          sudo chown -R $USER:$USER "$ANDROID_HOME"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1
+          for i in 1 2 3; do
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "cmake;3.31.6" "ndk;28.2.13676358" "platforms;android-36" "build-tools;36.0.0" > /dev/null && break
+            rm -rf "$ANDROID_HOME/.temp"
+          done
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/28.2.13676358" >> $GITHUB_ENV
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> $GITHUB_ENV
+          exit 0
 
-      - name: Install Native Build Tools
+      - name: Install Native Build Tools & Keystore
         run: |
-          sudo apt-get update
-          sudo apt-get install -y git cmake ninja-build ccache python3 python3-pip glslang-tools zip unzip jq
-
-      - name: Generate Release Signing Keystore
-        run: |
-          keytool -genkeypair -v \
-            -keystore /tmp/release.jks \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -alias release \
-            -storepass android123 -keypass android123 \
-            -dname "CN=EdenDuoNextendo, OU=Dev, O=EdenDuo, L=City, S=State, C=US"
+          sudo apt-get update && sudo apt-get install -y git cmake ninja-build ccache python3 glslang-tools zip unzip jq
+          keytool -genkeypair -v -keystore /tmp/release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias release -storepass android123 -keypass android123 -dname "CN=EdenDuoNextendo, OU=Dev, O=EdenDuo, L=City, S=State, C=US"
           echo "ANDROID_KEYSTORE_FILE=/tmp/release.jks" >> $GITHUB_ENV
           echo "ANDROID_KEYSTORE_B64=$(base64 -w 0 /tmp/release.jks)" >> $GITHUB_ENV
           echo "ANDROID_KEYSTORE_PASS=android123" >> $GITHUB_ENV
@@ -53,125 +53,31 @@ jobs:
 
       - name: Merge Nextendo Stack into Eden Duo & Strip Debug Packet Logging
         run: |
+          cp -rf workspace-den2/src/core/hle/service/{acc,friend,npns,sockets,ssl} workspace-edenduo/src/core/hle/service/
+          cp -f workspace-den2/src/common/{settings.h,settings.cpp,nextendo_*} workspace-edenduo/src/common/
+          cp -f workspace-den2/src/web_service/nextendo_* workspace-edenduo/src/web_service/
+          cp -f workspace-den2/src/core/loader/nextendo_* workspace-edenduo/src/core/loader/
           python3 - << 'PYEOF'
-          import os, re, shutil, pathlib
-
+          import re, pathlib
+          for base in [pathlib.Path("workspace-edenduo"), pathlib.Path("workspace-den2")]:
+              for rel in ["src/core/hle/service/sockets/bsd.cpp", "src/core/hle/service/ssl/ssl.cpp"]:
+                  p = base / rel
+                  if p.exists():
+                      p.write_text(re.sub(r'LOG_INFO\([^;]*\[Nextendo\][^;]*\);', '(void)0;', p.read_text()), encoding="utf-8")
           duo = pathlib.Path("workspace-edenduo")
-          den = pathlib.Path("workspace-den2")
-
-          for rel in ["src/core/hle/service/sockets/bsd.cpp", "src/core/hle/service/ssl/ssl.cpp"]:
-              p = den / rel
-              if p.exists():
-                  txt = p.read_text(encoding="utf-8", errors="ignore")
-                  txt = re.sub(r'LOG_INFO\([^;]*\[Nextendo\][^;]*\);', '(void)0;', txt)
-                  p.write_text(txt, encoding="utf-8")
-
-          duo_sh_path = duo / "src/common/settings.h"
-          den_sh_path = den / "src/common/settings.h"
-          duo_sh = duo_sh_path.read_text(encoding="utf-8")
-          den_sh = den_sh_path.read_text(encoding="utf-8")
-          duo_only = [l for l in duo_sh.splitlines() if l.strip() and l not in set(den_sh.splitlines())]
-          if not duo_only:
-              shutil.copy2(den_sh_path, duo_sh_path)
-              if (den / "src/common/settings.cpp").exists():
-                  shutil.copy2(den / "src/common/settings.cpp", duo / "src/common/settings.cpp")
-              print("[+] Copied Den2 settings.h & settings.cpp")
-          else:
-              den_only = [l for l in den_sh.splitlines() if l.strip() and l not in set(duo_sh.splitlines())]
-              duo_sh = re.sub(
-                  r'\};\s*(extern Values values;)',
-                  "\n    " + "\n    ".join(den_only) + r"\n};\n\n\1",
-                  duo_sh,
-                  count=1
-              )
-              duo_sh_path.write_text(duo_sh, encoding="utf-8")
-              print(f"[+] Merged {len(den_only)} Nextendo setting lines into Eden Duo settings.h")
-
-          standalone_files = [
-              "src/common/nextendo_account.cpp",
-              "src/common/nextendo_account.h",
-              "src/common/nextendo_friends.h",
-              "src/common/nextendo_nat.h",
-              "src/web_service/nextendo_api.cpp",
-              "src/web_service/nextendo_api.h",
-              "src/core/hle/service/ssl/nextendo_nat_rewrite.cpp",
-              "src/core/hle/service/ssl/nextendo_nat_rewrite.h",
-              "src/core/loader/nextendo_s3_patches.cpp",
-              "src/core/loader/nextendo_s3_patches.h",
-          ]
-          for rel in standalone_files:
-              src = den / rel
-              dst = duo / rel
-              if src.exists():
-                  dst.parent.mkdir(parents=True, exist_ok=True)
-                  shutil.copy2(src, dst)
-                  print(f"[+] Copied standalone module: {rel}")
-
-          hle_network_files = [
-              "src/core/hle/service/acc/acc.cpp",
-              "src/core/hle/service/acc/acc.h",
-              "src/core/hle/service/acc/profile_manager.cpp",
-              "src/core/hle/service/acc/profile_manager.h",
-              "src/core/hle/service/friend/friend.cpp",
-              "src/core/hle/service/friend/friend.h",
-              "src/core/hle/service/npns/npns.cpp",
-              "src/core/hle/service/sockets/bsd.cpp",
-              "src/core/hle/service/sockets/bsd.h",
-              "src/core/hle/service/sockets/nsd.cpp",
-              "src/core/hle/service/sockets/sfdnsres.cpp",
-              "src/core/hle/service/ssl/cert_store.cpp",
-              "src/core/hle/service/ssl/ssl.cpp",
-              "src/core/hle/service/ssl/ssl_backend_openssl.cpp",
-          ]
-          for rel in hle_network_files:
-              src = den / rel
-              dst = duo / rel
-              if src.exists():
-                  shutil.copy2(src, dst)
-                  print(f"[+] Synced HLE/Network service: {rel}")
-
-          def add_cmake_source(cmake_path, anchor, new_entries):
-              if not cmake_path.exists():
-                  return
-              txt = cmake_path.read_text(encoding="utf-8")
-              to_add = [e for e in new_entries if e not in txt]
-              if to_add and anchor in txt:
-                  replacement = anchor + "\n    " + "\n    ".join(to_add)
-                  cmake_path.write_text(txt.replace(anchor, replacement, 1), encoding="utf-8")
-                  print(f"[+] Registered {to_add} in {cmake_path}")
-
-          add_cmake_source(duo / "src/common/CMakeLists.txt", "uuid.h", ["nextendo_account.cpp", "nextendo_account.h", "nextendo_friends.h", "nextendo_nat.h"])
-          add_cmake_source(duo / "src/web_service/CMakeLists.txt", "web_backend.h", ["nextendo_api.cpp", "nextendo_api.h"])
-          add_cmake_source(duo / "src/core/CMakeLists.txt", "hle/service/ssl/ssl.h", ["hle/service/ssl/nextendo_nat_rewrite.cpp", "hle/service/ssl/nextendo_nat_rewrite.h"])
-          add_cmake_source(duo / "src/core/CMakeLists.txt", "loader/nso.h", ["loader/nextendo_s3_patches.cpp", "loader/nextendo_s3_patches.h"])
-
-          core_cpp = duo / "src/core/core.cpp"
-          if core_cpp.exists():
-              txt = core_cpp.read_text(encoding="utf-8")
-              if "nextendo_account.h" not in txt:
-                  txt = '#include "common/nextendo_account.h"\n' + txt
-              if "WriteGuestBridge" not in txt:
-                  txt = txt.replace(
-                      "status = app_loader->Load(*process, system);",
-                      "Common::NextendoAccount::WriteGuestBridge(Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir));\n        status = app_loader->Load(*process, system);"
-                  )
-              core_cpp.write_text(txt, encoding="utf-8")
-              print("[+] Patched src/core/core.cpp with NextendoAccount::WriteGuestBridge")
-
-          nso_cpp = duo / "src/core/loader/nso.cpp"
-          if nso_cpp.exists():
-              txt = nso_cpp.read_text(encoding="utf-8")
-              if "nextendo_s3_patches.h" not in txt:
-                  txt = '#include "core/loader/nextendo_s3_patches.h"\n' + txt
-              if "NextendoS3Patches::ApplyIfMatch" not in txt and "pm->PatchNSO(new_image, name)" in txt:
-                  txt = txt.replace(
-                      "new_image = pm->PatchNSO(new_image, name);",
-                      "new_image = pm->PatchNSO(new_image, name);\n        new_image = NextendoS3Patches::ApplyIfMatch(nso_header.build_id, std::move(new_image), name);"
-                  )
-              nso_cpp.write_text(txt, encoding="utf-8")
-              print("[+] Patched src/core/loader/nso.cpp with NextendoS3Patches")
-
-          print("[*] Surgical C++ merge complete.")
+          def reg(f, a, items):
+              p = duo / f
+              t = p.read_text()
+              if items[0] not in t:
+                  p.write_text(t.replace(a, a + "\n    " + "\n    ".join(items), 1))
+          reg("src/common/CMakeLists.txt", "uuid.h", ["nextendo_account.cpp", "nextendo_account.h", "nextendo_friends.h", "nextendo_nat.h"])
+          reg("src/web_service/CMakeLists.txt", "web_backend.h", ["nextendo_api.cpp", "nextendo_api.h"])
+          reg("src/core/CMakeLists.txt", "hle/service/ssl/ssl.h", ["hle/service/ssl/nextendo_nat_rewrite.cpp", "hle/service/ssl/nextendo_nat_rewrite.h"])
+          reg("src/core/CMakeLists.txt", "loader/nso.h", ["loader/nextendo_s3_patches.cpp", "loader/nextendo_s3_patches.h"])
+          c = duo / "src/core/core.cpp"
+          c.write_text('#include "common/nextendo_account.h"\n' + c.read_text().replace("status = app_loader->Load(*process, system);", "Common::NextendoAccount::WriteGuestBridge(Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir));\n        status = app_loader->Load(*process, system);"))
+          n = duo / "src/core/loader/nso.cpp"
+          n.write_text('#include "core/loader/nextendo_s3_patches.h"\n' + n.read_text().replace("new_image = pm->PatchNSO(new_image, name);", "new_image = pm->PatchNSO(new_image, name);\n        new_image = NextendoS3Patches::ApplyIfMatch(nso_header.build_id, std::move(new_image), name);"))
           PYEOF
 
       - name: Compile Unified EdenDuo + Nextendo Release APK (-O3 Release)
@@ -183,17 +89,13 @@ jobs:
           sh .ci/android/build.sh -t standard -b Release
           find artifacts src/android/app/build/outputs/apk -name "*.apk" -exec cp -v {} ../output-apks/EdenDuo-Nextendo-Release.apk \; || true
 
-      - name: Fallback Compile Den2 in Full -O3 Release Mode (if unified build had symbol conflicts)
+      - name: Fallback Compile Den2 in Full -O3 Release Mode
         if: steps.build_unified.outcome == 'failure'
         working-directory: workspace-den2
         run: |
           mkdir -p ../output-apks
           sh .ci/android/build.sh -t standard -b Release || sh .ci/android/build.sh -t standard -b RelWithDebInfo
-          for f in artifacts/*.apk src/android/app/build/outputs/apk/**/*.apk; do
-            if [ -f "$f" ]; then
-              cp -v "$f" ../output-apks/DEN-Turbo-Release.apk
-            fi
-          done
+          find artifacts src/android/app/build/outputs/apk -name "*.apk" -exec cp -v {} ../output-apks/DEN-Turbo-Release.apk \; || true
 
       - name: Upload Compiled Release APK Artifacts
         uses: actions/upload-artifact@v4
