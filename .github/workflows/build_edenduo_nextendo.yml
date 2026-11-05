@@ -1,0 +1,146 @@
+name: Build EdenDuo + Nextendo Unified APK (Release)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-edenduo-nextendo:
+    name: Merge Den2 (Nextendo) into Eden Duo 1.3.4 & Compile Release APK
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install Build Dependencies & Android NDK/SDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git cmake ninja-build ccache python3 python3-pip glslang-tools zip unzip jq
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Android SDK & NDK r27c (Clang 19.0.1)
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK 27.2.12479018 & CMake 3.30.5
+        run: |
+          sdkmanager --install "ndk;27.2.12479018" "cmake;3.30.5" "platforms;android-36" "build-tools;36.0.0"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> $GITHUB_ENV
+
+      - name: Clone Eden Duo (Base Dual-Screen Engine) & Den2 (Nextendo Stack)
+        run: |
+          git clone --recursive https://github.com/igawa6/eden-duo.git workspace-edenduo
+          git clone https://github.com/Dmr77680/Den2.git workspace-den2
+
+      - name: Merge Nextendo Online Stack into Eden Duo
+        run: |
+          python3 - << 'PYEOF'
+          import os, shutil, pathlib
+
+          duo = pathlib.Path("workspace-edenduo")
+          den = pathlib.Path("workspace-den2")
+
+          standalone_files = [
+              "src/common/nextendo_account.cpp",
+              "src/common/nextendo_account.h",
+              "src/common/nextendo_friends.h",
+              "src/common/nextendo_nat.h",
+              "src/web_service/nextendo_api.cpp",
+              "src/web_service/nextendo_api.h",
+              "src/core/hle/service/ssl/nextendo_nat_rewrite.cpp",
+              "src/core/hle/service/ssl/nextendo_nat_rewrite.h",
+              "src/core/loader/nextendo_s3_patches.cpp",
+              "src/core/loader/nextendo_s3_patches.h",
+          ]
+          for rel in standalone_files:
+              src = den / rel
+              dst = duo / rel
+              if src.exists():
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src, dst)
+                  print(f"[+] Copied standalone module: {rel}")
+
+          hle_network_files = [
+              "src/core/hle/service/acc/acc.cpp",
+              "src/core/hle/service/acc/acc.h",
+              "src/core/hle/service/acc/profile_manager.cpp",
+              "src/core/hle/service/acc/profile_manager.h",
+              "src/core/hle/service/friend/friend.cpp",
+              "src/core/hle/service/friend/friend.h",
+              "src/core/hle/service/npns/npns.cpp",
+              "src/core/hle/service/sockets/bsd.cpp",
+              "src/core/hle/service/sockets/bsd.h",
+              "src/core/hle/service/sockets/nsd.cpp",
+              "src/core/hle/service/sockets/sfdnsres.cpp",
+              "src/core/hle/service/ssl/cert_store.cpp",
+              "src/core/hle/service/ssl/ssl.cpp",
+              "src/core/hle/service/ssl/ssl_backend_openssl.cpp",
+              "src/core/arm/dynarmic/arm_dynarmic_32.cpp",
+          ]
+          for rel in hle_network_files:
+              src = den / rel
+              dst = duo / rel
+              if src.exists():
+                  shutil.copy2(src, dst)
+                  print(f"[+] Updated HLE/Network service: {rel}")
+
+          den_kt_root = den / "src/android/app/src/main/java/org/yuzu/yuzu_emu"
+          duo_kt_root = duo / "src/android/app/src/main/java/org/yuzu/yuzu_emu"
+          for p in den_kt_root.rglob("*Nextendo*"):
+              rel = p.relative_to(den_kt_root)
+              target = duo_kt_root / rel
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(p, target)
+              print(f"[+] Copied Android Kotlin file: {rel}")
+
+          den_res = den / "src/android/app/src/main/res"
+          duo_res = duo / "src/android/app/src/main/res"
+          for p in den_res.rglob("*nextendo*"):
+              rel = p.relative_to(den_res)
+              target = duo_res / rel
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(p, target)
+              print(f"[+] Copied Android resource: {rel}")
+
+          print("[*] Merge preparation complete.")
+          PYEOF
+
+      - name: Apply 3-Way Git Merge for Shared Files (nso.cpp, core.cpp, native.cpp, CMakeLists.txt, NativeLibrary.kt)
+        working-directory: workspace-edenduo
+        run: |
+          git remote add den2 ../workspace-den2
+          git fetch den2
+          COMMON_BASE=$(git merge-base HEAD den2/main || git rev-parse HEAD~10)
+          for shared in \
+            src/CMakeLists.txt \
+            src/common/CMakeLists.txt \
+            src/web_service/CMakeLists.txt \
+            src/core/CMakeLists.txt \
+            src/core/core.cpp \
+            src/core/loader/nso.cpp \
+            src/android/app/src/main/jni/native.cpp \
+            src/android/app/src/main/java/org/yuzu/yuzu_emu/NativeLibrary.kt \
+            src/android/app/src/main/java/org/yuzu/yuzu_emu/YuzuApplication.kt \
+            src/android/app/src/main/AndroidManifest.xml; do
+            if git cat-file -e "${COMMON_BASE}:${shared}" 2>/dev/null && [ -f "../workspace-den2/${shared}" ]; then
+              git show "${COMMON_BASE}:${shared}" > /tmp/base_file
+              git merge-file --union "${shared}" /tmp/base_file "../workspace-den2/${shared}" || true
+              echo "[+] 3-way merged shared file: ${shared}"
+            fi
+          done
+
+      - name: Compile Unified Release APK (mainlineRelease with -O3 & R8, No Validation Layer Bloat)
+        working-directory: workspace-edenduo/src/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleMainlineRelease \
+            -Pandroid.injected.build.abi=arm64-v8a \
+            -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=1g"
+
+      - name: Upload Compiled EdenDuo-Nextendo Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: EdenDuo-Nextendo-Release-APK
+          path: workspace-edenduo/src/android/app/build/outputs/apk/mainline/release/*.apk
