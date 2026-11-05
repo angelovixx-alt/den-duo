@@ -66,6 +66,27 @@ jobs:
                   txt = re.sub(r'LOG_INFO\([^;]*\[Nextendo\][^;]*\);', '(void)0;', txt)
                   p.write_text(txt, encoding="utf-8")
 
+          duo_sh_path = duo / "src/common/settings.h"
+          den_sh_path = den / "src/common/settings.h"
+          duo_sh = duo_sh_path.read_text(encoding="utf-8")
+          den_sh = den_sh_path.read_text(encoding="utf-8")
+          duo_only = [l for l in duo_sh.splitlines() if l.strip() and l not in set(den_sh.splitlines())]
+          if not duo_only:
+              shutil.copy2(den_sh_path, duo_sh_path)
+              if (den / "src/common/settings.cpp").exists():
+                  shutil.copy2(den / "src/common/settings.cpp", duo / "src/common/settings.cpp")
+              print("[+] Copied Den2 settings.h & settings.cpp")
+          else:
+              den_only = [l for l in den_sh.splitlines() if l.strip() and l not in set(duo_sh.splitlines())]
+              duo_sh = re.sub(
+                  r'\};\s*(extern Values values;)',
+                  "\n    " + "\n    ".join(den_only) + r"\n};\n\n\1",
+                  duo_sh,
+                  count=1
+              )
+              duo_sh_path.write_text(duo_sh, encoding="utf-8")
+              print(f"[+] Merged {len(den_only)} Nextendo setting lines into Eden Duo settings.h")
+
           standalone_files = [
               "src/common/nextendo_account.cpp",
               "src/common/nextendo_account.h",
@@ -107,7 +128,7 @@ jobs:
               dst = duo / rel
               if src.exists():
                   shutil.copy2(src, dst)
-                  print(f"[+] Updated HLE/Network service: {rel}")
+                  print(f"[+] Synced HLE/Network service: {rel}")
 
           def add_cmake_source(cmake_path, anchor, new_entries):
               if not cmake_path.exists():
@@ -132,10 +153,10 @@ jobs:
               if "WriteGuestBridge" not in txt:
                   txt = txt.replace(
                       "status = app_loader->Load(*process, system);",
-                      "Common::NextendoAccount::LoadFromDisk();\n        Common::NextendoAccount::WriteGuestBridge(Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir));\n        status = app_loader->Load(*process, system);"
+                      "Common::NextendoAccount::WriteGuestBridge(Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir));\n        status = app_loader->Load(*process, system);"
                   )
               core_cpp.write_text(txt, encoding="utf-8")
-              print("[+] Patched src/core/core.cpp with NextendoAccount::LoadFromDisk & WriteGuestBridge")
+              print("[+] Patched src/core/core.cpp with NextendoAccount::WriteGuestBridge")
 
           nso_cpp = duo / "src/core/loader/nso.cpp"
           if nso_cpp.exists():
@@ -162,8 +183,8 @@ jobs:
           sh .ci/android/build.sh -t standard -b Release
           find artifacts src/android/app/build/outputs/apk -name "*.apk" -exec cp -v {} ../output-apks/EdenDuo-Nextendo-Release.apk \; || true
 
-      - name: Compile Den2 in Full -O3 Release Mode (Optimized Nextendo Build)
-        continue-on-error: true
+      - name: Fallback Compile Den2 in Full -O3 Release Mode (if unified build had symbol conflicts)
+        if: steps.build_unified.outcome == 'failure'
         working-directory: workspace-den2
         run: |
           mkdir -p ../output-apks
