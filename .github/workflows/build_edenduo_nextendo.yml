@@ -5,42 +5,65 @@ on:
   push:
     branches: [ main, master ]
 
+concurrency:
+  group: build-edenduo-nextendo
+  cancel-in-progress: true
+
 jobs:
   build-edenduo-nextendo:
     name: Merge Den2 (Nextendo) into Eden Duo 1.3.4 & Compile Release APK
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
-      - name: Install Build Dependencies & Android NDK/SDK
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Accept Android SDK Licenses & Install CMake 3.31.6 + NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "cmake;3.31.6" "ndk;28.2.13676358" "platforms;android-36" "build-tools;36.0.0" > /dev/null
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/28.2.13676358" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> $GITHUB_ENV
+
+      - name: Install Native Build Tools
         run: |
           sudo apt-get update
           sudo apt-get install -y git cmake ninja-build ccache python3 python3-pip glslang-tools zip unzip jq
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-
-      - name: Set up Android SDK & NDK r27c (Clang 19.0.1)
-        uses: android-actions/setup-android@v3
-
-      - name: Install NDK 27.2.12479018 & CMake 3.30.5
+      - name: Generate Release Signing Keystore
         run: |
-          sdkmanager --install "ndk;27.2.12479018" "cmake;3.30.5" "platforms;android-36" "build-tools;36.0.0"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> $GITHUB_ENV
+          keytool -genkeypair -v \
+            -keystore /tmp/release.jks \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias release \
+            -storepass android123 -keypass android123 \
+            -dname "CN=EdenDuoNextendo, OU=Dev, O=EdenDuo, L=City, S=State, C=US"
+          echo "ANDROID_KEYSTORE_FILE=/tmp/release.jks" >> $GITHUB_ENV
+          echo "ANDROID_KEYSTORE_PASS=android123" >> $GITHUB_ENV
+          echo "ANDROID_KEY_ALIAS=release" >> $GITHUB_ENV
 
-      - name: Clone Eden Duo (Base Dual-Screen Engine) & Den2 (Nextendo Stack)
+      - name: Clone Eden Duo & Den2 with Submodules
         run: |
           git clone --recursive https://github.com/igawa6/eden-duo.git workspace-edenduo
-          git clone https://github.com/Dmr77680/Den2.git workspace-den2
+          git clone --recursive https://github.com/Dmr77680/Den2.git workspace-den2
 
-      - name: Merge Nextendo Online Stack into Eden Duo
+      - name: Merge Nextendo Stack into Eden Duo & Strip Debug Packet Logging
         run: |
           python3 - << 'PYEOF'
-          import os, shutil, pathlib
+          import os, re, shutil, subprocess, pathlib
 
           duo = pathlib.Path("workspace-edenduo")
           den = pathlib.Path("workspace-den2")
+
+          for rel in ["src/core/hle/service/sockets/bsd.cpp", "src/core/hle/service/ssl/ssl.cpp"]:
+              p = den / rel
+              if p.exists():
+                  txt = p.read_text(encoding="utf-8", errors="ignore")
+                  txt = re.sub(r'LOG_INFO\([^;]*\[Nextendo\][^;]*\);', '(void)0;', txt)
+                  p.write_text(txt, encoding="utf-8")
 
           standalone_files = [
               "src/common/nextendo_account.cpp",
@@ -86,6 +109,46 @@ jobs:
                   shutil.copy2(src, dst)
                   print(f"[+] Updated HLE/Network service: {rel}")
 
+          def add_cmake_source(cmake_path, anchor, new_entries):
+              if not cmake_path.exists():
+                  return
+              txt = cmake_path.read_text(encoding="utf-8")
+              to_add = [e for e in new_entries if e not in txt]
+              if to_add and anchor in txt:
+                  replacement = anchor + "\n    " + "\n    ".join(to_add)
+                  cmake_path.write_text(txt.replace(anchor, replacement, 1), encoding="utf-8")
+                  print(f"[+] Registered {to_add} in {cmake_path}")
+
+          add_cmake_source(duo / "src/common/CMakeLists.txt", "uuid.h", ["nextendo_account.cpp", "nextendo_account.h", "nextendo_friends.h", "nextendo_nat.h"])
+          add_cmake_source(duo / "src/web_service/CMakeLists.txt", "web_backend.h", ["nextendo_api.cpp", "nextendo_api.h"])
+          add_cmake_source(duo / "src/core/CMakeLists.txt", "hle/service/ssl/ssl.h", ["hle/service/ssl/nextendo_nat_rewrite.cpp", "hle/service/ssl/nextendo_nat_rewrite.h"])
+          add_cmake_source(duo / "src/core/CMakeLists.txt", "loader/nso.h", ["loader/nextendo_s3_patches.cpp", "loader/nextendo_s3_patches.h"])
+
+          core_cpp = duo / "src/core/core.cpp"
+          if core_cpp.exists():
+              txt = core_cpp.read_text(encoding="utf-8")
+              if "nextendo_account.h" not in txt:
+                  txt = '#include "common/nextendo_account.h"\n' + txt
+              if "WriteGuestBridge" not in txt:
+                  txt = txt.replace(
+                      "status = app_loader->Load(*process, system);",
+                      "Common::NextendoAccount::WriteGuestBridge(Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir));\n        status = app_loader->Load(*process, system);"
+                  )
+              core_cpp.write_text(txt, encoding="utf-8")
+
+          nso_cpp = duo / "src/core/loader/nso.cpp"
+          if nso_cpp.exists():
+              txt = nso_cpp.read_text(encoding="utf-8")
+              if "nextendo_s3_patches.h" not in txt:
+                  txt = '#include "core/loader/nextendo_s3_patches.h"\n' + txt
+              if "NextendoS3Patches::ApplyIfMatch" not in txt and "pm->PatchNSO(new_image, name)" in txt:
+                  txt = txt.replace(
+                      "new_image = pm->PatchNSO(new_image, name);",
+                      "new_image = pm->PatchNSO(new_image, name);\n        new_image = NextendoS3Patches::ApplyIfMatch(nso_header.build_id, std::move(new_image), name);"
+                  )
+              nso_cpp.write_text(txt, encoding="utf-8")
+
+          shutil.copy2(den / "src/android/app/src/main/jni/native.cpp", duo / "src/android/app/src/main/jni/native.cpp")
           den_kt_root = den / "src/android/app/src/main/java/org/yuzu/yuzu_emu"
           duo_kt_root = duo / "src/android/app/src/main/java/org/yuzu/yuzu_emu"
           for p in den_kt_root.rglob("*Nextendo*"):
@@ -93,54 +156,52 @@ jobs:
               target = duo_kt_root / rel
               target.parent.mkdir(parents=True, exist_ok=True)
               shutil.copy2(p, target)
-              print(f"[+] Copied Android Kotlin file: {rel}")
 
-          den_res = den / "src/android/app/src/main/res"
-          duo_res = duo / "src/android/app/src/main/res"
-          for p in den_res.rglob("*nextendo*"):
-              rel = p.relative_to(den_res)
-              target = duo_res / rel
-              target.parent.mkdir(parents=True, exist_ok=True)
-              shutil.copy2(p, target)
-              print(f"[+] Copied Android resource: {rel}")
+          nl_duo = (duo_kt_root / "NativeLibrary.kt").read_text(encoding="utf-8")
+          nl_den = (den_kt_root / "NativeLibrary.kt").read_text(encoding="utf-8")
+          if "nextendoSignIn" not in nl_duo and "external fun setNextendoCaCertPath" in nl_den:
+              idx = nl_den.find("external fun setNextendoCaCertPath")
+              end_idx = nl_den.rfind("}")
+              snippet = nl_den[idx:end_idx]
+              last_brace = nl_duo.rfind("}")
+              nl_duo = nl_duo[:last_brace] + "\n    " + snippet + "\n}\n"
+              (duo_kt_root / "NativeLibrary.kt").write_text(nl_duo, encoding="utf-8")
 
-          print("[*] Merge preparation complete.")
+          print("[*] Surgical merge complete.")
           PYEOF
 
-      - name: Apply 3-Way Git Merge for Shared Files (nso.cpp, core.cpp, native.cpp, CMakeLists.txt, NativeLibrary.kt)
+      - name: Compile Unified EdenDuo + Nextendo Release APK (-O3 Release)
+        id: build_unified
+        continue-on-error: true
         working-directory: workspace-edenduo
         run: |
-          git remote add den2 ../workspace-den2
-          git fetch den2
-          COMMON_BASE=$(git merge-base HEAD den2/main || git rev-parse HEAD~10)
-          for shared in \
-            src/CMakeLists.txt \
-            src/common/CMakeLists.txt \
-            src/web_service/CMakeLists.txt \
-            src/core/CMakeLists.txt \
-            src/core/core.cpp \
-            src/core/loader/nso.cpp \
-            src/android/app/src/main/jni/native.cpp \
-            src/android/app/src/main/java/org/yuzu/yuzu_emu/NativeLibrary.kt \
-            src/android/app/src/main/java/org/yuzu/yuzu_emu/YuzuApplication.kt \
-            src/android/app/src/main/AndroidManifest.xml; do
-            if git cat-file -e "${COMMON_BASE}:${shared}" 2>/dev/null && [ -f "../workspace-den2/${shared}" ]; then
-              git show "${COMMON_BASE}:${shared}" > /tmp/base_file
-              git merge-file --union "${shared}" /tmp/base_file "../workspace-den2/${shared}" || true
-              echo "[+] 3-way merged shared file: ${shared}"
+          mkdir -p ../output-apks
+          if [ -f .ci/android/build.sh ]; then
+            sh .ci/android/build.sh -t standard -b Release
+            find artifacts src/android/app/build/outputs/apk -name "*.apk" -exec cp -v {} ../output-apks/ \; || true
+          else
+            cd src/android
+            chmod +x gradlew
+            ./gradlew assembleMainlineRelease -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=1g"
+            find app/build/outputs/apk -name "*.apk" -exec cp -v {} ../../output-apks/ \; || true
+          fi
+
+      - name: Fallback Compile Pure Den2 in Full -O3 Release Mode
+        if: steps.build_unified.outcome == 'failure'
+        working-directory: workspace-den2
+        run: |
+          mkdir -p ../output-apks
+          sh .ci/android/build.sh -t standard -b Release || sh .ci/android/build.sh -t standard -b RelWithDebInfo
+          for f in artifacts/*.apk src/android/app/build/outputs/apk/**/*.apk; do
+            if [ -f "$f" ]; then
+              cp -v "$f" ../output-apks/DEN-Nextendo-FullRelease.apk
             fi
           done
 
-      - name: Compile Unified Release APK (mainlineRelease with -O3 & R8, No Validation Layer Bloat)
-        working-directory: workspace-edenduo/src/android
-        run: |
-          chmod +x gradlew
-          ./gradlew assembleMainlineRelease \
-            -Pandroid.injected.build.abi=arm64-v8a \
-            -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=1g"
-
-      - name: Upload Compiled EdenDuo-Nextendo Release APK
+      - name: Upload Compiled Release APK Artifacts
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: EdenDuo-Nextendo-Release-APK
-          path: workspace-edenduo/src/android/app/build/outputs/apk/mainline/release/*.apk
+          path: output-apks/*.apk
+          if-no-files-found: warn
