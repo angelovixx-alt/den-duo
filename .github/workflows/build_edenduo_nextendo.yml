@@ -60,11 +60,6 @@ jobs:
           cp -rf workspace-den2/src/network/* workspace-edenduo/src/network/
                   python3 - << 'PYEOF'
           import re, pathlib
-          for base in [pathlib.Path("workspace-edenduo"), pathlib.Path("workspace-den2")]:
-              for rel in ["src/core/hle/service/sockets/bsd.cpp", "src/core/hle/service/ssl/ssl.cpp"]:
-                  p = base / rel
-                  if p.exists():
-                      p.write_text(re.sub(r\bLOG_INFO\b', 'LOG_TRACE', p.read_text()), encoding="utf-8")
           duo = pathlib.Path("workspace-edenduo")
           def reg(f, a, items):
               p = duo / f
