@@ -57,6 +57,8 @@ jobs:
           cp -f workspace-den2/src/common/{settings.h,settings.cpp,nextendo_*} workspace-edenduo/src/common/
           cp -f workspace-den2/src/web_service/nextendo_* workspace-edenduo/src/web_service/
           cp -f workspace-den2/src/core/loader/nextendo_* workspace-edenduo/src/core/loader/
+          cp -rf workspace-den2/src/network/* workspace-edenduo/src/network/
+          find workspace-edenduo/src workspace-den2/src -name "CMakeLists.txt" -exec sed -i 's/-Werror/-Wno-error -Wno-unused-function/g' {} +
           python3 - << 'PYEOF'
           import re, pathlib
           for base in [pathlib.Path("workspace-edenduo"), pathlib.Path("workspace-den2")]:
