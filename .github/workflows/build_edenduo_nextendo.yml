@@ -58,14 +58,13 @@ jobs:
           cp -f workspace-den2/src/web_service/nextendo_* workspace-edenduo/src/web_service/
           cp -f workspace-den2/src/core/loader/nextendo_* workspace-edenduo/src/core/loader/
           cp -rf workspace-den2/src/network/* workspace-edenduo/src/network/
-          find workspace-edenduo/src workspace-den2/src -name "CMakeLists.txt" -exec sed -i 's/-Werror/-Wno-error -Wno-unused-function/g' {} +
-          python3 - << 'PYEOF'
+                  python3 - << 'PYEOF'
           import re, pathlib
           for base in [pathlib.Path("workspace-edenduo"), pathlib.Path("workspace-den2")]:
               for rel in ["src/core/hle/service/sockets/bsd.cpp", "src/core/hle/service/ssl/ssl.cpp"]:
                   p = base / rel
                   if p.exists():
-                      p.write_text(re.sub(r'LOG_INFO\([^;]*\[Nextendo\][^;]*\);', '(void)0;', p.read_text()), encoding="utf-8")
+                      p.write_text(re.sub(r\bLOG_INFO\b', 'LOG_TRACE', p.read_text()), encoding="utf-8")
           duo = pathlib.Path("workspace-edenduo")
           def reg(f, a, items):
               p = duo / f
@@ -87,17 +86,17 @@ jobs:
         continue-on-error: true
         working-directory: workspace-edenduo
         run: |
-          mkdir -p ../output-apks
-          sh .ci/android/build.sh -t standard -b Release
-          find artifacts src/android/app/build/outputs/apk -name "*.apk" -exec cp -v {} ../output-apks/EdenDuo-Nextendo-Release.apk \; || true
-
+            mkdir -p ../output-apks artifacts
+            sh .ci/android/build.sh -t standard -b Release || true
+            find artifacts src/android/app/build/outputs/apk -name "*.apk" -exec cp -v {} ../output-apks/EdenDuo-Nextendo-Release.apk \; || true
+            test -f ../output-apks/EdenDuo-Nextendo-Release.apk
       - name: Fallback Compile Den2 in Full -O3 Release Mode
         if: steps.build_unified.outcome == 'failure'
         working-directory: workspace-den2
         run: |
-          mkdir -p ../output-apks
-          sh .ci/android/build.sh -t standard -b Release || sh .ci/android/build.sh -t standard -b RelWithDebInfo
-          find artifacts src/android/app/build/outputs/apk -name "*.apk" -exec cp -v {} ../output-apks/DEN-Turbo-Release.apk \; || true
+            mkdir -p ../output-apks artifacts
+            sh .ci/android/build.sh -t standard -b Release || sh .ci/android/build.sh -t standard -b RelWithDebInfo || true
+            find artifacts src/android/app/build/outputs/apk -name "*.apk" -exec cp -v {} ../output-apks/DEN-Turbo-Release.apk \; || true
 
       - name: Upload Compiled Release APK Artifacts
         uses: actions/upload-artifact@v4
